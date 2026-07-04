@@ -1,7 +1,10 @@
-# Simple Encryptor , Robust, Secure
-# By MackTheDog Version 1.1.0 July 2026
-import tkinter as tk
-from tkinter import messagebox, filedialog, ttk
+#!/usr/bin/env python3
+#v1.3.4 serious flaw in reading multiple files corrected
+#
+#
+#
+import customtkinter as ctk
+from tkinter import messagebox, filedialog
 from tkinterdnd2 import TkinterDnD, DND_FILES
 import argon2
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -14,48 +17,49 @@ import queue
 from datetime import datetime
 import json
 from typing import List, Optional, Generator, Tuple
-import re
+import urllib.parse
+
+# Explicitly use dark mode to entirely bypass native gray styling quirks
+ctk.set_appearance_mode("Dark")  
+ctk.set_default_color_theme("blue")
 
 # -----------------------------------------------------------------------------
-# -- CRYPTO SERVICE CLASS WITH ENCRYPTED FAT HEADER & MEMORY HARDENING
+# -- CRYPTO SERVICE CLASS WITH ALIGNED SEAMLESS MULTI-FILE STREAMING
 # -----------------------------------------------------------------------------
 class CryptoService:
-    CHUNK_SIZE = 16 * 1024 * 1024
+    CHUNK_SIZE = 16 * 1024 * 1024  # 16 MB Chunk boundaries
     KEY_BYTES = 32
     SALT_BYTES = 32
     NONCE_BYTES = 12
-    HEADER_VERSION = b'\x09'  # Upgraded version for the FAT layout
-    MIN_PADDED_PLAINTEXT_SIZE = 5 * 1024 * 1024
+    HEADER_VERSION = b'\x09'
+    MIN_PADDED_PLAINTEXT_SIZE = 5 * 1024 * 1024  # 5 MB Masking Threshold
 
     def _zero_bytearray(self, b: bytearray) -> None:
-        """Securely overwrites sensitive RAM blocks with zeroes."""
         if b:
             for i in range(len(b)):
                 b[i] = 0
 
     def generate_master_key(self, password_str: str, salt: bytes, level: str) -> bytearray:
         if level == "Strong":
-            time_cost, memory_cost, parallelism = 16, 1048576, 4
+            time_cost, memory_cost, parallelism = 1, 1048576, 2  
         elif level == "Fast":
-            time_cost, memory_cost, parallelism = 2, 102400, 2
-        else: # Normal
-            time_cost, memory_cost, parallelism = 7, 524288, 2
+            time_cost, memory_cost, parallelism = 1, 204800, 2   
+        else: 
+            time_cost, memory_cost, parallelism = 2, 262144, 2   
             
-        raw_pwd = password_str.encode('utf-8')
+        raw_pwd = bytearray(password_str.encode('utf-8'))
         try:
             raw_key = argon2.low_level.hash_secret_raw(
-                secret=raw_pwd, salt=salt, time_cost=time_cost,
+                secret=bytes(raw_pwd), salt=salt, time_cost=time_cost,
                 memory_cost=memory_cost, parallelism=parallelism,
                 hash_len=self.KEY_BYTES, type=argon2.low_level.Type.ID
             )
             return bytearray(raw_key)
         finally:
-            # Wipe plain-text password from raw encoder bytes out of RAM instantly
             if isinstance(raw_pwd, bytearray):
                 self._zero_bytearray(raw_pwd)
 
     def derive_ephemeral_key(self, master_key: bytearray, info_str: str) -> bytearray:
-        """Derives an isolated key for individual structures (FAT vs Chunks)."""
         hkdf = HKDF(
             algorithm=hashes.SHA256(),
             length=self.KEY_BYTES,
@@ -79,22 +83,15 @@ class CryptoService:
         master_key = self.generate_master_key(password, salt, level)
         
         try:
-            # 1. Build Pre-FAT Architecture Map to calculate precise layout offsets
             fat_entries = []
-            current_payload_offset = 0 # Relative offset starting right after the FAT block
+            current_payload_offset = 0
             
             for full_path, relative_path in file_list:
                 real_size = os.path.getsize(full_path)
                 padded_plaintext_size = max(real_size, self.MIN_PADDED_PLAINTEXT_SIZE)
                 
-                # AESGCM tag adds overhead per chunk. Calculate how many chunks this payload will make
                 num_chunks = (padded_plaintext_size + self.CHUNK_SIZE - 1) // self.CHUNK_SIZE
-                # Format size per chunk: NONCE_BYTES (12) + LENGTH_FIELD (4) + CHUNK_DATA + AESGCM_TAG (16)
-                total_encrypted_entry_size = num_chunks * (self.NONCE_BYTES + 4 + self.CHUNK_SIZE + 16)
-                # Remainder chunk sizing adjustment
-                remainder = padded_plaintext_size % self.CHUNK_SIZE
-                if remainder != 0:
-                    total_encrypted_entry_size -= (self.CHUNK_SIZE - remainder)
+                total_encrypted_entry_size = num_chunks * (self.NONCE_BYTES + 4 + 16) + padded_plaintext_size
 
                 fat_entries.append({
                     'filename': relative_path,
@@ -104,7 +101,6 @@ class CryptoService:
                 })
                 current_payload_offset += total_encrypted_entry_size
 
-            # 2. Encrypt the FAT Header Block
             fat_bytes = json.dumps(fat_entries).encode('utf-8')
             fat_key = self.derive_ephemeral_key(master_key, "fat_header_encryption")
             
@@ -112,59 +108,67 @@ class CryptoService:
             fat_nonce = os.urandom(self.NONCE_BYTES)
             encrypted_fat = aesgcm_fat.encrypt(fat_nonce, fat_bytes, None)
             
-            self._zero_bytearray(fat_key) # Hardening wipe
+            self._zero_bytearray(fat_key)
 
-            # 3. Write Core Structures out to Storage
             with open(final_output_path, 'wb') as f_out:
                 f_out.write(self.HEADER_VERSION + salt)
                 f_out.write(fat_nonce)
                 f_out.write(len(encrypted_fat).to_bytes(4, 'big'))
                 f_out.write(encrypted_fat)
                 
-                # 4. Stream File Payloads and Padding Layers Sequentially
                 for index, (full_path, _) in enumerate(file_list):
                     yield processed_size, total_unencrypted_size
-                    
                     file_key = self.derive_ephemeral_key(master_key, f"file_payload_{index}")
                     
                     for chunk_processed in self._write_encrypted_payload(f_out, file_key, full_path, fat_entries[index]):
                         yield processed_size + chunk_processed, total_unencrypted_size
                         
                     processed_size += fat_entries[index]['real_size']
-                    self._zero_bytearray(file_key) # Hardening wipe
+                    self._zero_bytearray(file_key)
                     
             yield total_unencrypted_size, total_unencrypted_size
             return final_output_path
             
         finally:
-            self._zero_bytearray(master_key) # Complete core key scrub from memory
+            self._zero_bytearray(master_key)
 
     def _write_encrypted_payload(self, f_out, key: bytearray, full_path: str, fat_entry: dict) -> Generator[int, None, None]:
+        """FIXED: Unified stream chunk loader to perfectly preserve structural offset paths."""
         aesgcm = AESGCM(bytes(key))
         real_size = fat_entry['real_size']
-        padding_size = fat_entry['padded_plaintext_size'] - real_size
+        padded_size = fat_entry['padded_plaintext_size']
         
-        processed_in_file = 0
+        processed_real_bytes = 0
+        total_plaintext_streamed = 0
+        
+        seed_padding = os.urandom(65536)
+        
         with open(full_path, 'rb') as f_in:
-            while chunk := f_in.read(self.CHUNK_SIZE):
+            while total_plaintext_streamed < padded_size:
+                bytes_to_read = min(self.CHUNK_SIZE, padded_size - total_plaintext_streamed)
+                
+                # Read original file segments first
+                chunk = f_in.read(bytes_to_read) if processed_real_bytes < real_size else b''
+                actual_read_len = len(chunk)
+                processed_real_bytes += actual_read_len
+                
+                # If file ends before reaching the masking size threshold, append padding inline
+                if actual_read_len < bytes_to_read:
+                    needed_padding = bytes_to_read - actual_read_len
+                    padding_block = (seed_padding * ((needed_padding // len(seed_padding)) + 1))[:needed_padding]
+                    chunk += padding_block
+                
+                total_plaintext_streamed += len(chunk)
+                
                 content_nonce = os.urandom(self.NONCE_BYTES)
                 encrypted_content = aesgcm.encrypt(content_nonce, chunk, None)
+                
                 f_out.write(content_nonce)
                 f_out.write(len(encrypted_content).to_bytes(4, 'big'))
                 f_out.write(encrypted_content)
-                processed_in_file += len(chunk)
-                yield processed_in_file
-
-        remaining_padding = padding_size
-        while remaining_padding > 0:
-            chunk_size = min(remaining_padding, self.CHUNK_SIZE)
-            padding_chunk = os.urandom(chunk_size)
-            content_nonce = os.urandom(self.NONCE_BYTES)
-            encrypted_content = aesgcm.encrypt(content_nonce, padding_chunk, None)
-            f_out.write(content_nonce)
-            f_out.write(len(encrypted_content).to_bytes(4, 'big'))
-            f_out.write(encrypted_content)
-            remaining_padding -= chunk_size
+                
+                # Return progress relative to the real file content size
+                yield min(processed_real_bytes, real_size)
 
     def decrypt_archive(self, password: str, input_path: str, output_directory: str, level: str) -> Generator[Tuple[int, int], None, str]:
         total_archive_size = os.path.getsize(input_path)
@@ -182,7 +186,6 @@ class CryptoService:
             master_key = self.generate_master_key(password, salt, level)
             
             try:
-                # 1. Extract and Parse the Unified Encrypted FAT Header Block
                 fat_nonce = f_in.read(self.NONCE_BYTES)
                 fat_len_bytes = f_in.read(4)
                 if len(fat_nonce) < self.NONCE_BYTES or len(fat_len_bytes) < 4:
@@ -198,23 +201,19 @@ class CryptoService:
                 
                 fat_json = aesgcm_fat.decrypt(fat_nonce, encrypted_fat, None)
                 fat_entries = json.loads(fat_json)
-                
-                self._zero_bytearray(fat_key) # Hardening wipe
+                self._zero_bytearray(fat_key)
                 
                 processed_size += self.NONCE_BYTES + 4 + fat_len
                 yield processed_size, total_archive_size
                 
-                # Record the absolute boundary location where the payload sequence begins inside the file
                 absolute_payload_base_offset = f_in.tell()
 
-                # 2. Iterate and Extract file targets using f_in.seek dynamic jumps
                 for index, entry in enumerate(fat_entries):
                     relative_filename = entry['filename']
                     real_size = entry['real_size']
                     padded_plaintext_size = entry['padded_plaintext_size']
                     rel_offset = entry['relative_payload_offset']
                     
-                    # Target Path Traversal remediation block
                     output_filepath = os.path.join(output_directory, relative_filename)
                     resolved_path = os.path.abspath(output_filepath)
                     base_target_path = os.path.abspath(output_directory)
@@ -222,8 +221,6 @@ class CryptoService:
                         raise PermissionError(f"Directory traversal compromise caught: {relative_filename}")
                         
                     os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
-                    
-                    # CRITICAL OPTIMIZATION: Instant dynamic file pointer jump via FAT parameters
                     f_in.seek(absolute_payload_base_offset + rel_offset)
                     
                     file_key = self.derive_ephemeral_key(master_key, f"file_payload_{index}")
@@ -245,7 +242,6 @@ class CryptoService:
                             decrypted_chunk = aesgcm.decrypt(content_nonce, encrypted_content, None)
                             total_decrypted += len(decrypted_chunk)
                             
-                            # Fake out parsing updates globally via relative processing progress markers
                             processed_size += self.NONCE_BYTES + 4 + content_len
                             yield processed_size, total_archive_size
                             
@@ -255,10 +251,10 @@ class CryptoService:
                                 f_out.write(data_to_write)
                                 bytes_written += len(data_to_write)
                                 
-                    self._zero_bytearray(file_key) # Hardening wipe
+                    self._zero_bytearray(file_key)
                     
             finally:
-                self._zero_bytearray(master_key) # Complete core key scrub from memory
+                self._zero_bytearray(master_key)
                 
         return output_directory
 
@@ -275,175 +271,228 @@ class CryptoService:
                         relative_path = os.path.relpath(full_path, base_dir)
                         yield full_path, relative_path
 
+
 # -----------------------------------------------------------------------------
-# -- GUI CLASS (Unchanged infrastructure utilizing the updated engine streams)
+# -- ULTRA-MODERN CUSTOMTKINTER GUI WITH DRAG & DROP
 # -----------------------------------------------------------------------------
-class EncryptionApp:
+class ModernEncryptionApp:
     def __init__(self, root: TkinterDnD.Tk):
         self.root = root
         self.crypto_service = CryptoService()
-        self.root.title("Python Griffin Grinder 1.15.0 - Hardened FAT Architecture")
-        self.root.geometry("550x550")
-        self.root.minsize(500, 500)
-        self.root.configure(bg="#f0f0f0")
+        
+        self.root.title("Griffin Grinder Pro")
+        self.root.geometry("620x700")
+        self.root.minsize(580, 650)
+        
         self.input_paths: List[str] = []
         self.progress_queue = queue.Queue()
-        self.main_frame = tk.Frame(root, bg="#f0f0f0", padx=20, pady=20)
-        self.main_frame.pack(expand=True, fill="both")
         
-        tk.Label(self.main_frame, text="Password:", bg="#f0f0f0", font=("Helvetica", 10, "bold")).pack(anchor="w")
-        self.password_entry = tk.Entry(self.main_frame, show="*", width=50, font=("Helvetica", 10))
+        self.main_frame = ctk.CTkFrame(master=self.root, corner_radius=16, fg_color="#1a1a1a")
+        self.main_frame.pack(expand=True, fill="both", padx=20, pady=20)
+        
+        self.title_label = ctk.CTkLabel(self.main_frame, text="🛡️ GRIFFIN GRINDER PRO", font=ctk.CTkFont(size=20, weight="bold"), text_color="#ffffff")
+        self.title_label.pack(pady=(20, 10))
+
+        self.current_layout_mode = "Encrypt"
+        self.mode_var = ctk.StringVar(value="Encrypt")
+        self.mode_selector = ctk.CTkSegmentedButton(self.main_frame, values=["Encrypt", "Decrypt"], 
+                                                    command=self.handle_mode_switch, variable=self.mode_var,
+                                                    font=ctk.CTkFont(size=13, weight="bold"))
+        self.mode_selector.pack(fill="x", padx=30, pady=(0, 20))
+        
+        # --- PASSWORD AREA ---
+        self.pass_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.pass_frame.pack(fill="x", padx=30, pady=5)
+        
+        self.password_entry = ctk.CTkEntry(self.pass_frame, placeholder_text="Enter Master Password", show="*", height=45, fg_color="#262626")
         self.password_entry.pack(fill="x", pady=(0, 5))
-        self.password_entry.bind("<KeyRelease>", self._update_password_strength)
+        self.password_entry.bind("<KeyRelease>", self._validate_passwords)
         
-        strength_frame = tk.Frame(self.main_frame, bg="#f0f0f0")
-        strength_frame.pack(fill="x", pady=(0, 10))
-        self.strength_bar = ttk.Progressbar(strength_frame, orient="horizontal", length=100, mode="determinate")
-        self.strength_bar.pack(side="left", expand=True, fill="x")
-        self.strength_label = tk.Label(strength_frame, text="Strength", bg="#f0f0f0", width=10, anchor="w")
-        self.strength_label.pack(side="left", padx=(5, 0))
+        self.confirm_entry = ctk.CTkEntry(self.pass_frame, placeholder_text="Confirm Master Password", show="*", height=45, fg_color="#262626")
+        self.confirm_entry.pack(fill="x", pady=5)
+        self.confirm_entry.bind("<KeyRelease>", self._validate_passwords)
         
-        tk.Label(self.main_frame, text="Security Level:", bg="#f0f0f0", font=("Helvetica", 10, "bold")).pack(anchor="w")
-        self.security_level = ttk.Combobox(self.main_frame, values=["Fast", "Normal", "Paranoid"], state="readonly")
+        self.status_feedback_label = ctk.CTkLabel(self.pass_frame, text="", font=ctk.CTkFont(size=14, weight="bold"))
+        self.status_feedback_label.pack(anchor="w", padx=5, pady=2)
+        
+        # --- CONFIG SELECTION AREA ---
+        self.config_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.config_frame.pack(fill="x", padx=30, pady=(5, 15))
+        
+        self.level_label = ctk.CTkLabel(self.config_frame, text="KDF Security Threshold Profile:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#aaaaaa")
+        self.level_label.pack(side="left", padx=(5, 10))
+        
+        self.security_level = ctk.CTkComboBox(self.config_frame, values=["Fast", "Normal", "Strong"], width=140, fg_color="#262626")
         self.security_level.set("Normal")
-        self.security_level.pack(fill="x", pady=(0, 15))
+        self.security_level.pack(side="right")
         
-        tk.Label(self.main_frame, text="Package Contents:", bg="#f0f0f0", font=("Helvetica", 10, "bold")).pack(anchor="w")
-        self.text_input = tk.Text(self.main_frame, height=8, relief="solid", borderwidth=1, font=("Helvetica", 9), bg="white")
-        self.text_input.pack(expand=True, fill="both", pady=(0, 15))
-        self.text_input.drop_target_register(DND_FILES)
-        self.text_input.dnd_bind('<<Drop>>', self.handle_drop)
-        self.text_input.insert("1.0", "Drag and drop files or folders here...")
-        self.text_input.config(state="disabled")
+        # --- THE LANDING PAD ---
+        self.drop_zone = ctk.CTkTextbox(self.main_frame, corner_radius=12, border_width=2, border_color="#333333",
+                                        font=ctk.CTkFont(size=13), fg_color="#121212", text_color="#e0e0e0")
+        self.drop_zone.pack(expand=True, fill="both", padx=30, pady=(5, 15))
         
-        self.progress_label = tk.Label(self.main_frame, text="Status: Ready", bg="#f0f0f0", anchor="w")
-        self.progress_label.pack(fill="x")
-        self.progress_bar = ttk.Progressbar(self.main_frame, orient="horizontal", length=100, mode="determinate")
-        self.progress_bar.pack(fill="x", pady=(0, 15))
+        self.drop_zone.drop_target_register(DND_FILES)
+        self.drop_zone.dnd_bind('<<Drop>>', self.handle_drop)
         
-        button_container = tk.Frame(self.main_frame, bg="#f0f0f0")
-        button_container.pack(fill="x")
-        self.mode_var = tk.StringVar(value="Encrypt")
-        encrypt_button = tk.Radiobutton(button_container, text="Encrypt", variable=self.mode_var, value="Encrypt", command=self.update_ui_for_mode, bg="#f0f0f0", indicatoron=0, width=10, relief="raised", selectcolor="#c8e6c9")
-        encrypt_button.pack(side="left")
-        decrypt_button = tk.Radiobutton(button_container, text="Decrypt", variable=self.mode_var, value="Decrypt", command=self.update_ui_for_mode, bg="#f0f0f0", indicatoron=0, width=10, relief="raised", selectcolor="#ffcdd2")
-        decrypt_button.pack(side="left", padx=5)
+        # --- PROGRESS & STATUS TRACKING ---
+        self.progress_label = ctk.CTkLabel(self.main_frame, text="Status: Awaiting Input Target", font=ctk.CTkFont(size=12), text_color="#888888")
+        self.progress_label.pack(anchor="w", padx=35)
         
-        self.process_button = tk.Button(button_container, text="Process", command=self.process, font=("Helvetica", 10, "bold"), bg="#4CAF50", fg="white")
+        self.progress_bar = ctk.CTkProgressBar(self.main_frame, orientation="horizontal", height=8, progress_color="#2ecc71")
+        self.progress_bar.set(0)
+        self.progress_bar.pack(fill="x", padx=30, pady=(2, 20))
+        
+        # --- CONTROL ACTION BAR ---
+        self.button_container = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.button_container.pack(fill="x", padx=30, pady=(0, 20))
+        
+        self.clear_button = ctk.CTkButton(self.button_container, text="Clear Session", fg_color="#3a3a3a", hover_color="#505050", text_color="#ffffff", command=self.clear_fields, width=120)
+        self.clear_button.pack(side="left")
+        
+        self.process_button = ctk.CTkButton(self.button_container, text="Lock Package", font=ctk.CTkFont(weight="bold"), command=self.process, width=150)
         self.process_button.pack(side="right")
-        self.clear_button = tk.Button(button_container, text="Clear", command=self.clear_fields)
-        self.clear_button.pack(side="right", padx=5)
         
-        self._update_password_strength()
+        self.update_display_text()
         self.check_queue()
 
-    def _update_password_strength(self, event=None):
-        password, score = self.password_entry.get(), 0
-        if len(password) >= 8: score += 1
-        if len(password) >= 12: score += 1
-        if re.search(r"[a-z]", password): score += 1
-        if re.search(r"[A-Z]", password): score += 1
-        if re.search(r"[0-9]", password): score += 1
-        if re.search(r"[\W_]", password): score += 1
-        colors = {0: ("#f0f0f0", "Too short"), 1: ("#ff4d4d", "Very Weak"), 2: ("#ff8c4d", "Weak"), 3: ("#ffd24d", "Medium"), 4: ("#86e06c", "Good"), 5: ("#33cc33", "Strong"), 6: ("#009933", "Very Strong")}
-        color, text = colors.get(score, colors[0])
-        self.strength_bar['value'] = (score / 6) * 100
-        self.strength_label.config(text=text)
-        style_name = f"Strength.{text.replace(' ', '')}.Horizontal.TProgressbar"
-        ttk.Style().configure(style_name, background=color)
-        self.strength_bar.config(style=style_name)
+    def handle_mode_switch(self, selected_mode: str, force_clear: bool = True):
+        if force_clear:
+            self.input_paths.clear()
+            self.password_entry.delete(0, 'end')
+            self.confirm_entry.delete(0, 'end')
+        
+        self.current_layout_mode = selected_mode
+        self.mode_var.set(selected_mode)
+
+        if selected_mode == "Decrypt":
+            self.confirm_entry.pack_forget()
+            self.process_button.configure(text="Unlock & Extract", fg_color="#2980b9", hover_color="#3498db")
+        else:
+            self.confirm_entry.pack(after=self.password_entry, fill="x", pady=5)
+            self.process_button.configure(text="Lock Package", fg_color="#2ecc71", hover_color="#27ae60")
+            
+        self.update_display_text()
+        self._validate_passwords()
+
+    def _validate_passwords(self, event=None) -> bool:
+        mode = self.mode_var.get()
+        p1 = self.password_entry.get()
+        p2 = self.confirm_entry.get()
+        
+        if len(p1) < 8:
+            self.status_feedback_label.configure(text="⚠️ Minimum safety threshold: 8 characters required.", text_color="#ff4d4d")
+            self.process_button.configure(state="disabled")
+            return False
+            
+        if mode == "Encrypt":
+            if p1 != p2:
+                self.status_feedback_label.configure(text="❌ Entry Error: Master passwords do not match.", text_color="#ff4d4d")
+                self.process_button.configure(state="disabled")
+                return False
+            else:
+                self.status_feedback_label.configure(text="✨ Verification success: Passwords match.", text_color="#2ecc71")
+                self.process_button.configure(state="normal")
+                return True
+        else:
+            self.status_feedback_label.configure(text="🔒 Ready to decode matching archive context.", text_color="#3498db")
+            self.process_button.configure(state="normal")
+            return True
+
+    def handle_drop(self, event):
+        try:
+            raw_dropped_items = self.root.tk.splitlist(event.data)
+            dropped_items = []
+            
+            for path in raw_dropped_items:
+                path = path.strip()
+                if path.startswith("file://"):
+                    path = urllib.parse.unquote(path[7:])
+                if os.path.exists(path):
+                    dropped_items.append(path)
+
+            if not dropped_items:
+                return
+                
+            is_package_file = len(dropped_items) == 1 and dropped_items[0].endswith('.grn')
+            
+            if is_package_file:
+                self.input_paths = dropped_items
+                self.handle_mode_switch("Decrypt", force_clear=False)
+            else:
+                for p in dropped_items:
+                    if p not in self.input_paths and not p.endswith('.grn'):
+                        self.input_paths.append(p)
+                self.handle_mode_switch("Encrypt", force_clear=False)
+                
+            self.update_display_text()
+            self._validate_passwords()
+        except Exception as e:
+            messagebox.showerror("Drop Processing Defect", f"Could not map targeted filesystem layout: {e}")
+            self.clear_fields()
+
+    def update_display_text(self):
+        self.drop_zone.configure(state="normal")
+        self.drop_zone.delete("1.0", "end")
+        
+        if not self.input_paths:
+            display_text = "\n\n\n\t\t📥 LANDING PAD INFRASTRUCTURE\n\n\t\tDrag and drop folders or files here..."
+        elif self.mode_var.get() == "Decrypt":
+            display_text = f"\n📦 TARGET ARMORED PACKAGE DETECTED:\n\n- {os.path.basename(self.input_paths[0])}"
+        else:
+            display_text = f"📂 PENDING STRUCTURAL ROOT ALLOCATIONS ({len(self.input_paths)} items):\n\n"
+            for p in self.input_paths:
+                display_text += f"- {os.path.basename(p)}\n"
+                
+        self.drop_zone.insert("1.0", display_text)
+        self.drop_zone.configure(state="disabled")
+
+    def clear_fields(self):
+        self.input_paths.clear()
+        self.password_entry.delete(0, 'end')
+        self.confirm_entry.delete(0, 'end')
+        self.handle_mode_switch("Encrypt", force_clear=True)
+        self.progress_bar.set(0)
+        self.progress_label.configure(text="Status: Cleaned Session.")
+        self._validate_passwords()
 
     def check_queue(self):
         try:
             while True:
                 message = self.progress_queue.get_nowait()
-                if isinstance(message, tuple) and len(message) == 2:
+                if isinstance(message, tuple):
                     processed, total = message
-                    percent = (processed / total) * 100 if total > 0 else 0
-                    self.progress_bar['value'] = percent
-                    self.progress_label.config(text=f"Processing... {int(percent)}%")
+                    ratio = (processed / total) if total > 0 else 0
+                    self.progress_bar.set(ratio)
+                    self.progress_label.configure(text=f"Processing Payload Stream... {int(ratio * 100)}%")
                 elif isinstance(message, str):
-                    self.progress_label.config(text=message)
+                    self.progress_label.configure(text=message)
         except queue.Empty:
             pass
         finally:
             self.root.after(100, self.check_queue)
-            
-    def handle_drop(self, event):
-        try:
-            newly_dropped_paths = [p for p in self.root.tk.splitlist(event.data) if p.strip() and os.path.exists(p.strip())]
-            if not newly_dropped_paths:
-                return
-            is_decrypt_file = len(newly_dropped_paths) == 1 and newly_dropped_paths[0].endswith('.grn')
-            if is_decrypt_file:
-                self.input_paths = newly_dropped_paths
-                self.mode_var.set("Decrypt")
-            else:
-                for p in newly_dropped_paths:
-                    if p not in self.input_paths:
-                        self.input_paths.append(p)
-                self.mode_var.set("Encrypt")
-            self.update_display_text()
-        except Exception as e:
-            messagebox.showerror("Drop Error", f"Could not process dropped items: {e}")
-            self.clear_fields()
-
-    def update_display_text(self):
-        self.text_input.config(state="normal")
-        self.text_input.delete("1.0", tk.END)
-        if not self.input_paths:
-            display_text = "Drag and drop files or folders here..."
-        elif self.mode_var.get() == "Decrypt":
-            display_text = f"Ready to decrypt archive:\n\n- {os.path.basename(self.input_paths[0])}"
-        else:
-            display_text = f"Ready to package {len(self.input_paths)} root item(s):\n\n"
-            for path in self.input_paths:
-                display_text += f"- {os.path.basename(path)}\n"
-        self.text_input.insert("1.0", display_text)
-        self.update_ui_for_mode()
-        self.text_input.config(state="disabled")
-
-    def update_ui_for_mode(self):
-        if self.mode_var.get() == "Decrypt":
-            self.text_input.config(bg="#e0e8f0")
-        else:
-            self.text_input.config(bg="white")
-
-    def clear_fields(self):
-        self.input_paths.clear()
-        self.password_entry.delete(0, tk.END)
-        self.mode_var.set("Encrypt")
-        self.update_display_text()
-        self.progress_bar['value'] = 0
-        self.progress_label.config(text="Status: Ready")
-        self._update_password_strength()
 
     def process(self):
+        if not self._validate_passwords():
+            return
+            
         password = self.password_entry.get()
-        if not self.input_paths:
-            messagebox.showwarning("Input Required", "Please drop one or more files/folders first.")
-            return
-        if len(password) < 8:
-            messagebox.showerror("Invalid Password", "Password must be at least 8 characters long.")
-            return
-        
-        self.process_button.config(state="disabled", text="Processing...")
-        self.progress_bar['value'] = 0
-        self.progress_label.config(text="Starting...")
         mode = self.mode_var.get()
         level = self.security_level.get()
         
+        self.process_button.configure(state="disabled", text="Computing KDF...")
+        self.progress_bar.set(0)
+        
         if mode == "Decrypt":
-            output_dir_parent = filedialog.askdirectory(title="Select Folder to Save Decrypted Files", initialdir=os.path.expanduser('~'))
+            output_dir_parent = filedialog.askdirectory(title="Select Destination Extract Root", initialdir=os.path.expanduser('~'))
             if not output_dir_parent:
-                self.process_button.config(state="normal", text="Process")
+                self.handle_mode_switch(mode, force_clear=False)
                 return
             archive_name = os.path.basename(self.input_paths[0]).replace('.grn', '')
             output_directory = os.path.join(output_dir_parent, f"decrypted_{archive_name}")
             args = (mode, password, self.input_paths, level, output_directory)
         else:
             args = (mode, password, self.input_paths, level, None)
-        
+            
         thread = threading.Thread(target=self._process_threaded, args=args, daemon=True)
         thread.start()
 
@@ -461,28 +510,23 @@ class EncryptionApp:
                 except StopIteration as e:
                     result_path = e.value
                     break
-            
-            self.progress_queue.put(f"Process complete! Output saved to {result_path}")
-            self.root.after(0, lambda: messagebox.showinfo("Success", f"Process complete!\nOutput saved to:\n{result_path}"))
+                    
+            self.progress_queue.put(f"Success! Destination mapped to {os.path.basename(result_path)}")
+            self.root.after(0, lambda: messagebox.showinfo("Process Complete", f"Operation executed successfully!\nSaved to:\n{result_path}"))
             self.root.after(0, self.clear_fields)
-
         except (InvalidTag, argon2.exceptions.VerifyMismatchError):
-            self.root.after(0, lambda: messagebox.showerror("Error", "Decryption failed. Invalid password or package manipulation caught."))
+            self.root.after(0, lambda: messagebox.showerror("Cryptographic Rejection", "Operation Failed. Struct authenticity validation failed or incorrect master password sequence."))
         except PermissionError as pe:
-            self.root.after(0, lambda: messagebox.showerror("Security Threat Exception", str(pe)))
+            self.root.after(0, lambda: messagebox.showerror("Security Boundary Warning", str(pe)))
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Error", f"An unexpected processing error occurred: {e}"))
+            self.root.after(0, lambda: messagebox.showerror("Fatal Pipeline Defect", f"An internal failure occurred during stream processing: {e}"))
         finally:
-            self.root.after(0, lambda: self.process_button.config(state="normal", text="Process"))
-            self.root.after(0, lambda: self.progress_label.config(text="Status: Done"))
+            self.root.after(0, lambda: self.handle_mode_switch(self.mode_var.get(), force_clear=False))
 
-# -----------------------------------------------------------------------------
-# -- MAIN EXECUTION
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     try:
         root = TkinterDnD.Tk()
-        app = EncryptionApp(root)
+        app = ModernEncryptionApp(root)
         root.mainloop()
     except Exception as e:
-        messagebox.showerror("Fatal Error", f"Application failed to start: {e}")
+        messagebox.showerror("Fatal System Panic", f"Runtime environment failed to initialize application bindings: {e}")
